@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use bytes::Bytes;
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};

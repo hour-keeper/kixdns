@@ -539,8 +539,7 @@ impl RuntimeResponseMatcher {
             }
             RuntimeResponseMatcher::ResponseQclass { value } => value == &qclass,
             RuntimeResponseMatcher::ResponseEdnsPresent { expect } => {
-                #[allow(deprecated)]
-                let edns = msg.edns().is_some();
+                let edns = msg.extensions().is_some();
                 edns == *expect
             }
         }

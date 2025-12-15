@@ -265,7 +265,7 @@ impl Engine {
                 question.query_type(),
                 question.query_class(),
                 req.id(),
-                req.edns().is_some(),
+                req.extensions().is_some(),
             )
         };
 

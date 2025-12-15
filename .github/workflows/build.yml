@@ -1,0 +1,145 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [ created ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation dependencies
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target (per target)
+        uses: actions/cache@v4
+        with:
+          path: target/${{ matrix.target }}
+          key: ${{ runner.os }}-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ matrix.target }}-
+
+      - name: Set up cross-compilation environment
+        if: matrix.arch == 'arm64'
+        run: |
+          # 设置交叉编译环境变量
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          strip target/${{ matrix.target }}/release/kixdns || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kixdns-linux-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/kixdns
+          retention-days: 30
+
+  build-freebsd:
+    name: Build FreeBSD ${{ matrix.arch }} (cross)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-freebsd
+            arch: x86_64
+            toolchain: stable
+            build_std: ""
+          - target: aarch64-unknown-freebsd
+            arch: arm64
+            toolchain: nightly
+            build_std: "-Z build-std=std,panic_abort"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.toolchain }}-
+
+      - name: Cache target (per target)
+        uses: actions/cache@v4
+        with:
+          path: target/${{ matrix.target }}
+          key: ${{ runner.os }}-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ matrix.target }}-
+
+      - name: Install toolchain and cross # cross 用于 FreeBSD 交叉构建（x86_64: stable；aarch64: nightly+build-std）
+        run: |
+          if ! command -v cross >/dev/null 2>&1; then
+            cargo install cross --git https://github.com/cross-rs/cross
+          else
+            echo "cross already installed, skip install"
+          fi
+          rustup toolchain install ${{ matrix.toolchain }}
+          rustup component add rust-src --toolchain ${{ matrix.toolchain }}
+
+      - name: Build FreeBSD ${{ matrix.arch }}
+        run: |
+          if [ -n "${{ matrix.build_std }}" ]; then
+            cross +${{ matrix.toolchain }} build --target ${{ matrix.target }} ${{ matrix.build_std }} --release
+          else
+            cross +${{ matrix.toolchain }} build --target ${{ matrix.target }} --release
+          fi
+          strip target/${{ matrix.target }}/release/kixdns || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kixdns-freebsd-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/kixdns
+          retention-days: 30
+
