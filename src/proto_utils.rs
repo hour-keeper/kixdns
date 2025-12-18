@@ -138,7 +138,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             
             // Validate arithmetic to prevent overflow and ensure entire record fits in packet
             let rd_len_usize = rd_len as usize;
-            if packet.len() < 10 + rd_len_usize || next_pos > packet.len() - 10 - rd_len_usize { break; }
+            // Check packet length first to avoid underflow in subsequent arithmetic
+            if packet.len() < 10 + rd_len_usize { break; }
+            if next_pos > packet.len() - 10 - rd_len_usize { break; }
             ar_pos = next_pos + 10 + rd_len_usize;
         }
     }
@@ -155,10 +157,13 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     })
 }
 
+/// Maximum number of compression pointer jumps allowed to prevent infinite loops
+const MAX_COMPRESSION_JUMPS: u32 = 5;
+
 /// 跳过 DNS 名称并返回下一个位置 / Skip DNS name and return next position
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
-    let mut max_jumps = 5; // Protection against infinite loops from compression pointer cycles
+    let mut max_jumps = MAX_COMPRESSION_JUMPS;
     
     loop {
         if pos >= packet_len { return None; }
