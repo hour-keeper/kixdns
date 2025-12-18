@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use bytes::Bytes;
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -199,15 +198,10 @@ async fn run_udp_worker(
         if buf.capacity() < 4096 {
             buf.reserve(4096 - buf.len());
         }
-        // 这是一个 unsafe 操作，因为 recv_from 需要 &mut [u8]，但 BytesMut 未初始化的部分不能直接给 safe Rust / This is an unsafe operation because recv_from requires &mut [u8], but uninitialized parts of BytesMut cannot be directly given to safe Rust
-        // 但是 tokio 的 UdpSocket::recv_buf 支持 BytesMut，不过这里我们用标准 recv_from / However, tokio's UdpSocket::recv_buf supports BytesMut, but we use standard recv_from here
-        // 简单起见，我们先 resize，然后 truncate / For simplicity, we resize first, then truncate
-        // 性能损耗极小，因为 resize 0u8 也是 memset / Performance loss is minimal because resize 0u8 is also memset
-        unsafe { buf.set_len(buf.capacity()); }
         
-        match socket.recv_from(&mut buf).await {
-            Ok((len, peer)) => {
-                unsafe { buf.set_len(len); }
+        // 使用 tokio 的 recv_buf_from 配合 BytesMut，实现安全且零拷贝的接收 / Use tokio's recv_buf_from with BytesMut for safe and zero-copy reception
+        match socket.recv_buf_from(&mut buf).await {
+            Ok((_len, peer)) => {
                 // 零拷贝获取 Bytes / Zero-copy obtain Bytes
                 let packet_bytes = buf.split().freeze();
                 

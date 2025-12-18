@@ -6,6 +6,7 @@ pub struct QuickQuery<'a> {
     pub qname: &'a str,
     pub qtype: u16,
     pub qclass: u16,
+    pub edns_present: bool,
 }
 
 /// 仅解析 DNS 头部和第一个 Query，用于快速缓存查找 / Parse only DNS header and first query for quick cache lookup
@@ -19,8 +20,12 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // 1. Transaction ID / 事务ID
     let tx_id = u16::from_be_bytes([packet[0], packet[1]]);
 
-    // 2. Flags (QDCOUNT at offset 4) / 标志位（QDCOUNT 在偏移量 4）
+    // 2. Counts / 计数
     let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
+    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
+    let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
+
     if qd_count == 0 {
         return None;
     }
@@ -103,6 +108,33 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     }
     let qtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
     let qclass = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
+    pos += 4;
+
+    // 5. Check for EDNS in Additional section / 在附加部分检查 EDNS
+    let mut edns_present = false;
+    if ar_count > 0 && an_count == 0 && ns_count == 0 {
+        // For standard queries, AN and NS are 0. We only check Additional if they are 0 to keep it fast.
+        // 对于标准查询，AN 和 NS 为 0。我们仅在它们为 0 时检查 Additional 以保持速度。
+        let mut ar_pos = pos;
+        for _ in 0..ar_count {
+            if ar_pos >= packet.len() { break; }
+            let name_byte = packet[ar_pos];
+            let next_pos = if name_byte == 0 {
+                ar_pos + 1
+            } else {
+                skip_name(packet, ar_pos).unwrap_or(packet.len())
+            };
+
+            if next_pos + 10 > packet.len() { break; }
+            let rr_type = u16::from_be_bytes([packet[next_pos], packet[next_pos + 1]]);
+            if rr_type == 41 { // OPT
+                edns_present = true;
+                break;
+            }
+            let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]);
+            ar_pos = next_pos + 10 + rd_len as usize;
+        }
+    }
 
     // Return slice of buf / 返回缓冲区的切片
     let qname = from_utf8(&buf[..buf_pos]).ok()?;
@@ -112,7 +144,20 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         qname,
         qtype,
         qclass,
+        edns_present,
     })
+}
+
+/// 跳过 DNS 名称并返回下一个位置 / Skip DNS name and return next position
+fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
+    let packet_len = packet.len();
+    loop {
+        if pos >= packet_len { return None; }
+        let len = packet[pos];
+        if len == 0 { return Some(pos + 1); }
+        if (len & 0xC0) == 0xC0 { return Some(pos + 2); }
+        pos += 1 + len as usize;
+    }
 }
 
 /// 快速解析响应包，仅提取 RCODE 和最小 TTL / Quick parse response packet, extracting only RCODE and minimum TTL

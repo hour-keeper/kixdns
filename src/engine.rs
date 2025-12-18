@@ -132,7 +132,7 @@ impl Engine {
             None => {
                 // quick parse failed / 快速解析失败
                 let elapsed = t_start.elapsed().as_nanos();
-                tracing::info!(request_id = req_id, phase = "parse_quick_fail", elapsed_ns = elapsed, "fastpath parse failed");
+                tracing::debug!(request_id = req_id, phase = "parse_quick_fail", elapsed_ns = elapsed, "fastpath parse failed");
                 return Ok(None);
             }
         };
@@ -143,13 +143,12 @@ impl Engine {
         // 获取 pipeline ID / Get pipeline ID
         let cfg = self.pipeline.load();
         let qclass = DNSClass::from(q.qclass);
-        let edns_present = false;
         let (_pipeline_opt, pipeline_id) = select_pipeline(
             &cfg,
             q.qname,
             peer.ip(),
             qclass,
-            edns_present,
+            q.edns_present,
             &self.listener_label,
         );
         
@@ -164,7 +163,8 @@ impl Engine {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id.as_ref() == pipeline_id {
                 // 复制 ID 到缓存响应中 / Copy ID into cached response
-                let mut resp = hit.bytes.to_vec();
+                let mut resp = bytes::BytesMut::with_capacity(hit.bytes.len());
+                resp.extend_from_slice(&hit.bytes);
                 if resp.len() >= 2 {
                     let id_bytes = q.tx_id.to_be_bytes();
                     resp[0] = id_bytes[0];
@@ -172,8 +172,8 @@ impl Engine {
                 }
                 self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                 let elapsed = t_after_parse.as_nanos();
-                tracing::info!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
-                return Ok(Some(Bytes::from(resp)));
+                tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
+                return Ok(Some(resp.freeze()));
             }
         }
 
@@ -186,7 +186,7 @@ impl Engine {
                 qtype,
                 qclass,
                 peer.ip(),
-                false,
+                q.edns_present,
             ) {
                 if let Decision::Static { rcode, answers } = decision {
                     let resp = build_fast_static_response(
@@ -199,7 +199,7 @@ impl Engine {
                     )?;
                     self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                     let elapsed_ns = t_start.elapsed().as_nanos();
-                    tracing::info!(request_id = req_id, phase = "fast_static", elapsed_ns = elapsed_ns, "fast static match");
+                    tracing::debug!(request_id = req_id, phase = "fast_static", elapsed_ns = elapsed_ns, "fast static match");
                     return Ok(Some(resp));
                 }
             }
@@ -221,7 +221,7 @@ impl Engine {
                     )?;
                     self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                     let elapsed_ns = t_start.elapsed().as_nanos();
-                    tracing::info!(request_id = req_id, phase = "rule_cache_hit", elapsed_ns = elapsed_ns, "rule cache hit");
+                    tracing::debug!(request_id = req_id, phase = "rule_cache_hit", elapsed_ns = elapsed_ns, "rule cache hit");
                     return Ok(Some(resp));
                 }
             }
@@ -254,49 +254,51 @@ impl Engine {
 
         // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
         let mut qname_buf = [0u8; 256];
-        let (qname, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
-            (q.qname.to_string(), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, false) // TODO: check EDNS in quick parse / TODO：在快速解析中检查 EDNS
+        let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = parse_quick(packet, &mut qname_buf) {
+            (std::borrow::Cow::Borrowed(q.qname), hickory_proto::rr::RecordType::from(q.qtype), DNSClass::from(q.qclass), q.tx_id, q.edns_present)
         } else {
             // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
             let req = Message::from_bytes(packet).context("parse request")?;
             let question = req.queries().first().context("empty question")?;
             (
-                question.name().to_lowercase().to_string(),
+                std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
                 question.query_type(),
                 question.query_class(),
                 req.id(),
-                req.edns().is_some(),
+                req.extensions().is_some(),
             )
         };
+        let qname_ref = &qname_cow;
 
         let start = std::time::Instant::now();
 
         let (pipeline_opt, pipeline_id) = select_pipeline(
             &cfg,
-            &qname,
+            qname_ref,
             peer.ip(),
             qclass,
             edns_present,
             &self.listener_label,
         );
 
-        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, &qname, qtype);
+        let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname_ref, qtype);
         // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
         if let Some(hit) = self.cache.get(&dedupe_hash) {
-            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == qname && hit.pipeline_id.as_ref() == pipeline_id {
+            if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == *qname_ref && hit.pipeline_id.as_ref() == pipeline_id {
                 let latency = start.elapsed();
                 // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
-                let mut resp_vec = hit.bytes.to_vec();
-                if resp_vec.len() >= 2 {
+                let mut resp_bytes = bytes::BytesMut::with_capacity(hit.bytes.len());
+                resp_bytes.extend_from_slice(&hit.bytes);
+                if resp_bytes.len() >= 2 {
                     let id_bytes = tx_id.to_be_bytes();
-                    resp_vec[0] = id_bytes[0];
-                    resp_vec[1] = id_bytes[1];
+                    resp_bytes[0] = id_bytes[0];
+                    resp_bytes[1] = id_bytes[1];
                 }
-                let resp_bytes = Bytes::from(resp_vec);
-                info!(
+                let resp_bytes = resp_bytes.freeze();
+                debug!(
                     event = "dns_response",
                     upstream = %hit.source,
-                    qname = %qname,
+                    qname = %qname_ref,
                     qtype = ?qtype,
                     rcode = ?hit.rcode,
                     latency_ms = latency.as_millis() as u64,
@@ -309,6 +311,7 @@ impl Engine {
             }
         }
 
+        let qname = qname_cow.into_owned();
         let mut skip_rules = HashSet::new();
         let mut current_pipeline_id = pipeline_id.clone();
         let mut dedupe_hash = Self::calculate_cache_hash_for_dedupe(&current_pipeline_id, &qname, qtype);
