@@ -43,9 +43,7 @@ enum RecvResult {
 #[inline]
 fn set_transaction_id(packet: &mut [u8], tx_id: u16) {
     if packet.len() >= 2 {
-        let id_bytes = tx_id.to_be_bytes();
-        packet[0] = id_bytes[0];
-        packet[1] = id_bytes[1];
+        packet[..2].copy_from_slice(&tx_id.to_be_bytes());
     }
 }
 
@@ -299,7 +297,8 @@ async fn run_udp_worker(
                             if let Err(ref e) = send_result {
                                 if e.kind() == std::io::ErrorKind::WouldBlock {
                                     // Fallback to async send on backpressure
-                                    let mut response = bytes::BytesMut::from(&cached[..]);
+                                    let mut response = bytes::BytesMut::with_capacity(cached.len());
+                                    response.extend_from_slice(&cached);
                                     set_transaction_id(&mut response, tx_id);
                                     spawn_async_send(Arc::clone(&socket), response.freeze(), peer);
                                 }
