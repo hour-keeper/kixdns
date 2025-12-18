@@ -1915,7 +1915,7 @@ impl UdpClient {
         let mut attempts = 0;
         let mut new_id;
         loop {
-            new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
+            new_id = state.next_id.fetch_add(1, Ordering::AcqRel);
             if !state.inflight.contains_key(&new_id) {
                 break;
             }
