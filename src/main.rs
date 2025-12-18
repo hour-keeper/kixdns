@@ -55,7 +55,9 @@ fn set_transaction_id(packet: &mut [u8], tx_id: u16) {
 /// responses are not silently dropped under backpressure.
 fn spawn_async_send(socket: Arc<UdpSocket>, data: bytes::Bytes, peer: SocketAddr) {
     tokio::spawn(async move {
-        let _ = socket.send_to(&data, peer).await;
+        if let Err(e) = socket.send_to(&data, peer).await {
+            tracing::warn!("async send fallback failed to {}: {}", peer, e);
+        }
     });
 }
 
