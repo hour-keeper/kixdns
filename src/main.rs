@@ -21,6 +21,23 @@ use crate::config::load_config;
 use crate::engine::{Engine, FastPathResponse};
 use crate::matcher::RuntimePipelineConfig;
 
+/// Result type for batch UDP receive operations
+enum RecvResult {
+    Packet(bytes::Bytes, std::net::SocketAddr),
+    NoData,
+    Error,
+}
+
+/// Set transaction ID in the first two bytes of a DNS packet
+#[inline]
+fn set_transaction_id(packet: &mut [u8], tx_id: u16) {
+    if packet.len() >= 2 {
+        let id_bytes = tx_id.to_be_bytes();
+        packet[0] = id_bytes[0];
+        packet[1] = id_bytes[1];
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "KixDNS async DNS with hot-reload pipelines", long_about = None)]
 struct Args {
@@ -203,12 +220,6 @@ async fn run_udp_worker(
         const MAX_BATCH: usize = 32;
 
         while batch_count < MAX_BATCH {
-            enum RecvResult {
-                Packet(bytes::Bytes, std::net::SocketAddr),
-                NoData,
-                Error,
-            }
-            
             let recv_result = RECV_BUF.with(|rb| {
                 let mut buf = rb.borrow_mut();
                 let current_len = buf.len();
@@ -261,11 +272,7 @@ async fn run_udp_worker(
                                     send_buf.reserve(cached.len() - cap);
                                 }
                                 send_buf.extend_from_slice(&cached);
-                                if send_buf.len() >= 2 {
-                                    let id_bytes = tx_id.to_be_bytes();
-                                    send_buf[0] = id_bytes[0];
-                                    send_buf[1] = id_bytes[1];
-                                }
+                                set_transaction_id(&mut send_buf, tx_id);
                                 socket.try_send_to(&send_buf, peer)
                             });
                             
@@ -274,11 +281,7 @@ async fn run_udp_worker(
                                     // Fallback to async send on backpressure
                                     let socket = Arc::clone(&socket);
                                     let mut response = cached.to_vec();
-                                    if response.len() >= 2 {
-                                        let id_bytes = tx_id.to_be_bytes();
-                                        response[0] = id_bytes[0];
-                                        response[1] = id_bytes[1];
-                                    }
+                                    set_transaction_id(&mut response, tx_id);
                                     tokio::spawn(async move {
                                         let _ = socket.send_to(&response, peer).await;
                                     });
