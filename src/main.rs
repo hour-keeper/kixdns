@@ -49,6 +49,16 @@ fn set_transaction_id(packet: &mut [u8], tx_id: u16) {
     }
 }
 
+/// Spawn an async task to send data to peer when socket buffer is full
+///
+/// This is used as a fallback when `try_send_to` returns WouldBlock to ensure
+/// responses are not silently dropped under backpressure.
+fn spawn_async_send(socket: Arc<UdpSocket>, data: bytes::Bytes, peer: SocketAddr) {
+    tokio::spawn(async move {
+        let _ = socket.send_to(&data, peer).await;
+    });
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "KixDNS async DNS with hot-reload pipelines", long_about = None)]
 struct Args {
@@ -266,10 +276,7 @@ async fn run_udp_worker(
                             match socket.try_send_to(&bytes, peer) {
                                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                     // Fallback to async send on backpressure
-                                    let socket = Arc::clone(&socket);
-                                    tokio::spawn(async move {
-                                        let _ = socket.send_to(&bytes, peer).await;
-                                    });
+                                    spawn_async_send(Arc::clone(&socket), bytes, peer);
                                 }
                                 _ => {}
                             }
@@ -290,12 +297,9 @@ async fn run_udp_worker(
                             if let Err(ref e) = send_result {
                                 if e.kind() == std::io::ErrorKind::WouldBlock {
                                     // Fallback to async send on backpressure
-                                    let socket = Arc::clone(&socket);
-                                    let mut response = cached.to_vec();
+                                    let mut response = bytes::BytesMut::from(&cached[..]);
                                     set_transaction_id(&mut response, tx_id);
-                                    tokio::spawn(async move {
-                                        let _ = socket.send_to(&response, peer).await;
-                                    });
+                                    spawn_async_send(Arc::clone(&socket), response.freeze(), peer);
                                 }
                             }
                         }
