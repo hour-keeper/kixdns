@@ -34,6 +34,16 @@ use crate::matcher::{
 };
 use crate::proto_utils::parse_quick;
 
+/// Fast-path response for UDP workers.
+///
+/// - `Direct`: already has correct TXID and can be sent as-is.
+/// - `CacheHit`: carries cached bytes (with an old TXID) and the request TXID to patch.
+#[derive(Debug, Clone)]
+pub enum FastPathResponse {
+    Direct(Bytes),
+    CacheHit { cached: Bytes, tx_id: u16 },
+}
+
 #[derive(Clone)]
 pub struct Engine {
     pipeline: Arc<ArcSwap<RuntimePipelineConfig>>,
@@ -121,7 +131,11 @@ impl Engine {
     /// 返回 Ok(None) 表示需要异步处理（上游转发） / Return Ok(None) means async processing needed (upstream forwarding)
     /// 返回 Err 表示解析错误 / Return Err means parsing error
     #[inline]
-    pub fn handle_packet_fast(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Option<Bytes>> {
+    pub fn handle_packet_fast(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+    ) -> anyhow::Result<Option<FastPathResponse>> {
         // 快速解析，避免完整 Message 解析和大量分配 / Quick parsing, avoiding full Message parsing and massive allocations
         // 使用栈上缓冲区避免 String 分配 / Use stack buffer to avoid String allocation
         let mut qname_buf = [0u8; 256];
@@ -162,18 +176,13 @@ impl Engine {
         if let Some(hit) = self.cache.get(&cache_hash) {
             // Verify collision / 验证冲突
             if hit.qtype == u16::from(qtype) && hit.qname.as_ref() == q.qname && hit.pipeline_id.as_ref() == pipeline_id {
-                // 复制 ID 到缓存响应中 / Copy ID into cached response
-                let mut resp = bytes::BytesMut::with_capacity(hit.bytes.len());
-                resp.extend_from_slice(&hit.bytes);
-                if resp.len() >= 2 {
-                    let id_bytes = q.tx_id.to_be_bytes();
-                    resp[0] = id_bytes[0];
-                    resp[1] = id_bytes[1];
-                }
                 self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                 let elapsed = t_after_parse.as_nanos();
                 tracing::debug!(request_id = req_id, phase = "cache_hit", elapsed_ns = elapsed, "fastpath cache hit");
-                return Ok(Some(resp.freeze()));
+                return Ok(Some(FastPathResponse::CacheHit {
+                    cached: hit.bytes.clone(),
+                    tx_id: q.tx_id,
+                }));
             }
         }
 
@@ -200,7 +209,7 @@ impl Engine {
                     self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                     let elapsed_ns = t_start.elapsed().as_nanos();
                     tracing::debug!(request_id = req_id, phase = "fast_static", elapsed_ns = elapsed_ns, "fast static match");
-                    return Ok(Some(resp));
+                    return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
         }
@@ -222,7 +231,7 @@ impl Engine {
                     self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
                     let elapsed_ns = t_start.elapsed().as_nanos();
                     tracing::debug!(request_id = req_id, phase = "rule_cache_hit", elapsed_ns = elapsed_ns, "rule cache hit");
-                    return Ok(Some(resp));
+                    return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
         }

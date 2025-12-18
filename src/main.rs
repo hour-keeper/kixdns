@@ -19,7 +19,7 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::load_config;
-use crate::engine::Engine;
+use crate::engine::{Engine, FastPathResponse};
 use crate::matcher::RuntimePipelineConfig;
 
 #[derive(Parser, Debug)]
@@ -192,6 +192,8 @@ async fn run_udp_worker(
     // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
     let mut buf = BytesMut::with_capacity(4096);
+    // 复用发送缓冲区：用于缓存命中时 patch TXID，避免每包堆分配 / Reuse send buffer to patch TXID on cache hits, avoiding per-packet heap allocation
+    let mut send_buf = BytesMut::with_capacity(512);
 
     loop {
         // 确保有足够的空间 / Ensure sufficient space
@@ -207,10 +209,26 @@ async fn run_udp_worker(
                 
                 // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)
                 match engine.handle_packet_fast(&packet_bytes, peer) {
-                    Ok(Some(resp)) => {
-                        // 缓存命中，直接发送 / Cache hit, send directly
-                        let _ = socket.send_to(&resp, peer).await;
-                    }
+                    Ok(Some(resp)) => match resp {
+                        FastPathResponse::Direct(bytes) => {
+                            // 已包含正确 TXID，可直接发送 / Already contains correct TXID
+                            let _ = socket.send_to(&bytes, peer).await;
+                        }
+                        FastPathResponse::CacheHit { cached, tx_id } => {
+                            // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
+                            send_buf.clear();
+                            if send_buf.capacity() < cached.len() {
+                                send_buf.reserve(cached.len() - send_buf.capacity());
+                            }
+                            send_buf.extend_from_slice(&cached);
+                            if send_buf.len() >= 2 {
+                                let id_bytes = tx_id.to_be_bytes();
+                                send_buf[0] = id_bytes[0];
+                                send_buf[1] = id_bytes[1];
+                            }
+                            let _ = socket.send_to(&send_buf, peer).await;
+                        }
+                    },
                     Ok(None) => {
                         // 需要异步处理（上游转发），spawn 处理 / Need async processing (upstream forwarding), spawn for handling
                         // packet_bytes 已经是 Bytes，无需再次 copy / packet_bytes is already Bytes, no need to copy again
