@@ -203,7 +203,13 @@ async fn run_udp_worker(
         const MAX_BATCH: usize = 32;
 
         while batch_count < MAX_BATCH {
-            let mut packet_opt = RECV_BUF.with(|rb| {
+            enum RecvResult {
+                Packet(bytes::Bytes, std::net::SocketAddr),
+                NoData,
+                Error,
+            }
+            
+            let recv_result = RECV_BUF.with(|rb| {
                 let mut buf = rb.borrow_mut();
                 let current_len = buf.len();
                 if buf.capacity() < 4096 {
@@ -213,21 +219,21 @@ async fn run_udp_worker(
                 match socket.try_recv_buf_from(&mut *buf) {
                     Ok((_len, peer)) => {
                         let packet = buf.split().freeze();
-                        Some((packet, peer))
+                        RecvResult::Packet(packet, peer)
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => RecvResult::NoData,
                     Err(_e) => {
                         // 严重错误则退出 / Exit on severe error
-                        Some((bytes::Bytes::new(), "0.0.0.0:0".parse().unwrap())) // Dummy to trigger error handling
+                        RecvResult::Error
                     }
                 }
             });
 
-            if let Some((packet_bytes, peer)) = packet_opt.take() {
-                if packet_bytes.is_empty() && peer.port() == 0 {
-                    // 模拟错误处理 / Simulated error handling
-                    break;
-                }
+            let (packet_bytes, peer) = match recv_result {
+                RecvResult::Packet(packet, peer) => (packet, peer),
+                RecvResult::NoData => break,
+                RecvResult::Error => break,
+            };
                 
                 batch_count += 1;
 
@@ -235,10 +241,19 @@ async fn run_udp_worker(
                 match engine.handle_packet_fast(&packet_bytes, peer) {
                     Ok(Some(resp)) => match resp {
                         FastPathResponse::Direct(bytes) => {
-                            let _ = socket.try_send_to(&bytes, peer);
+                            match socket.try_send_to(&bytes, peer) {
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // Fallback to async send on backpressure
+                                    let socket = Arc::clone(&socket);
+                                    tokio::spawn(async move {
+                                        let _ = socket.send_to(&bytes, peer).await;
+                                    });
+                                }
+                                _ => {}
+                            }
                         }
                         FastPathResponse::CacheHit { cached, tx_id } => {
-                            SEND_BUF.with(|sb| {
+                            let send_result = SEND_BUF.with(|sb| {
                                 let mut send_buf = sb.borrow_mut();
                                 send_buf.clear();
                                 let cap = send_buf.capacity();
@@ -251,8 +266,24 @@ async fn run_udp_worker(
                                     send_buf[0] = id_bytes[0];
                                     send_buf[1] = id_bytes[1];
                                 }
-                                let _ = socket.try_send_to(&send_buf, peer);
+                                socket.try_send_to(&send_buf, peer)
                             });
+                            
+                            if let Err(ref e) = send_result {
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    // Fallback to async send on backpressure
+                                    let socket = Arc::clone(&socket);
+                                    let mut response = cached.to_vec();
+                                    if response.len() >= 2 {
+                                        let id_bytes = tx_id.to_be_bytes();
+                                        response[0] = id_bytes[0];
+                                        response[1] = id_bytes[1];
+                                    }
+                                    tokio::spawn(async move {
+                                        let _ = socket.send_to(&response, peer).await;
+                                    });
+                                }
+                            }
                         }
                     },
                     Ok(None) => {
@@ -266,10 +297,6 @@ async fn run_udp_worker(
                     }
                     Err(_) => {}
                 }
-            } else {
-                // 没有更多数据，跳出批量循环 / No more data, break batch loop
-                break;
-            }
         }
     }
 }

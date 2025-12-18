@@ -50,7 +50,7 @@ pub struct EngineInner {
 }
 
 thread_local! {
-    static CANDIDATE_CACHE: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::with_capacity(128));
+    static ENGINE_CANDIDATE_CACHE: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(Vec::with_capacity(128));
 }
 
 #[derive(Clone)]
@@ -908,7 +908,7 @@ impl Engine {
         }
 
         // 2. Candidate Selection (compiled index if available)
-        let decision = CANDIDATE_CACHE.with(|cache| {
+        let decision = ENGINE_CANDIDATE_CACHE.with(|cache| {
             let mut candidates = cache.borrow_mut();
             if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
                 compiled.index.fill_candidates(qname, qtype, &mut candidates);
@@ -1777,10 +1777,7 @@ struct UdpSocketState {
     // Key: Upstream ID (newly generated)
     // Value: (Original ID, Upstream Address, Sender)
     inflight: Arc<DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>)>>,
-}
-
-thread_local! {
-    static NEXT_UPSTREAM_ID: std::cell::Cell<u16> = std::cell::Cell::new(0);
+    next_id: AtomicU16,
 }
 
 /// 高性能 UDP 客户端池，使用 channel 分发 socket / High-performance UDP client pool using channel for socket distribution
@@ -1813,6 +1810,7 @@ impl UdpClient {
                 let state = UdpSocketState {
                     socket: socket.clone(),
                     inflight: inflight.clone(),
+                    next_id: AtomicU16::new(0),
                 };
                 pool.push(state);
 
@@ -1917,11 +1915,7 @@ impl UdpClient {
         let mut attempts = 0;
         let mut new_id;
         loop {
-            new_id = NEXT_UPSTREAM_ID.with(|id| {
-                let val = id.get();
-                id.set(val.wrapping_add(1));
-                val
-            });
+            new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
             if !state.inflight.contains_key(&new_id) {
                 break;
             }
