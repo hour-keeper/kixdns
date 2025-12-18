@@ -32,7 +32,7 @@ use crate::config::{Action, Transport};
 use crate::matcher::{
     RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcherWithOp, eval_match_chain,
 };
-use crate::proto_utils::parse_quick;
+use crate::proto_utils::{parse_quick, build_static_response_fast};
 
 /// Fast-path response for UDP workers.
 ///
@@ -223,6 +223,16 @@ impl Engine {
                 q.edns_present,
             ) {
                 if let Decision::Static { rcode, answers } = decision {
+                    if answers.is_empty() {
+                        // 优化：使用预编码模板快速生成响应 / Optimization: use pre-encoded template for fast response generation
+                        if let Some(bytes) = build_static_response_fast(packet, rcode) {
+                            self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
+                            let elapsed_ns = t_start.elapsed().as_nanos();
+                            tracing::debug!(request_id = req_id, phase = "fast_static_preencoded", elapsed_ns = elapsed_ns, "fast static match preencoded");
+                            return Ok(Some(FastPathResponse::Direct(Bytes::from(bytes))));
+                        }
+                    }
+
                     let resp = build_fast_static_response(
                         q.tx_id,
                         q.qname,
@@ -1807,7 +1817,10 @@ struct UdpSocketState {
     // Key: Upstream ID (newly generated)
     // Value: (Original ID, Upstream Address, Sender)
     inflight: Arc<DashMap<u16, (u16, SocketAddr, oneshot::Sender<anyhow::Result<Bytes>>)>>,
-    next_id: AtomicU16,
+}
+
+thread_local! {
+    static NEXT_UPSTREAM_ID: std::cell::Cell<u16> = std::cell::Cell::new(0);
 }
 
 /// 高性能 UDP 客户端池，使用 channel 分发 socket / High-performance UDP client pool using channel for socket distribution
@@ -1840,7 +1853,6 @@ impl UdpClient {
                 let state = UdpSocketState {
                     socket: socket.clone(),
                     inflight: inflight.clone(),
-                    next_id: AtomicU16::new(0),
                 };
                 pool.push(state);
 
@@ -1945,7 +1957,11 @@ impl UdpClient {
         let mut attempts = 0;
         let mut new_id;
         loop {
-            new_id = state.next_id.fetch_add(1, Ordering::Relaxed);
+            new_id = NEXT_UPSTREAM_ID.with(|id| {
+                let val = id.get();
+                id.set(val.wrapping_add(1));
+                val
+            });
             if !state.inflight.contains_key(&new_id) {
                 break;
             }
