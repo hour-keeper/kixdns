@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use arc_swap::ArcSwap;
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -19,7 +18,7 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::load_config;
-use crate::engine::Engine;
+use crate::engine::{Engine, FastPathResponse};
 use crate::matcher::RuntimePipelineConfig;
 
 #[derive(Parser, Debug)]
@@ -53,10 +52,9 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("parse tcp bind addr")?;
 
-    let pipeline = Arc::new(ArcSwap::from_pointee(cfg));
-    let engine = Engine::new(pipeline.clone(), args.listener_label.clone());
+    let engine = Engine::new(cfg, args.listener_label.clone());
 
-    watcher::spawn(args.config.clone(), pipeline.clone());
+    watcher::spawn(args.config.clone(), engine.clone());
 
     // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
     let udp_workers = if args.udp_workers > 0 {
@@ -192,30 +190,43 @@ async fn run_udp_worker(
     // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
     let mut buf = BytesMut::with_capacity(4096);
+    // 复用发送缓冲区：用于缓存命中时 patch TXID，避免每包堆分配 / Reuse send buffer to patch TXID on cache hits, avoiding per-packet heap allocation
+    let mut send_buf = BytesMut::with_capacity(512);
 
     loop {
         // 确保有足够的空间 / Ensure sufficient space
         if buf.capacity() < 4096 {
             buf.reserve(4096 - buf.len());
         }
-        // 这是一个 unsafe 操作，因为 recv_from 需要 &mut [u8]，但 BytesMut 未初始化的部分不能直接给 safe Rust / This is an unsafe operation because recv_from requires &mut [u8], but uninitialized parts of BytesMut cannot be directly given to safe Rust
-        // 但是 tokio 的 UdpSocket::recv_buf 支持 BytesMut，不过这里我们用标准 recv_from / However, tokio's UdpSocket::recv_buf supports BytesMut, but we use standard recv_from here
-        // 简单起见，我们先 resize，然后 truncate / For simplicity, we resize first, then truncate
-        // 性能损耗极小，因为 resize 0u8 也是 memset / Performance loss is minimal because resize 0u8 is also memset
-        unsafe { buf.set_len(buf.capacity()); }
         
-        match socket.recv_from(&mut buf).await {
-            Ok((len, peer)) => {
-                unsafe { buf.set_len(len); }
+        // 使用 tokio 的 recv_buf_from 配合 BytesMut，实现安全且零拷贝的接收 / Use tokio's recv_buf_from with BytesMut for safe and zero-copy reception
+        match socket.recv_buf_from(&mut buf).await {
+            Ok((_len, peer)) => {
                 // 零拷贝获取 Bytes / Zero-copy obtain Bytes
                 let packet_bytes = buf.split().freeze();
                 
                 // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)
                 match engine.handle_packet_fast(&packet_bytes, peer) {
-                    Ok(Some(resp)) => {
-                        // 缓存命中，直接发送 / Cache hit, send directly
-                        let _ = socket.send_to(&resp, peer).await;
-                    }
+                    Ok(Some(resp)) => match resp {
+                        FastPathResponse::Direct(bytes) => {
+                            // 已包含正确 TXID，可直接发送 / Already contains correct TXID
+                            let _ = socket.send_to(&bytes, peer).await;
+                        }
+                        FastPathResponse::CacheHit { cached, tx_id } => {
+                            // 复用 send_buf：copy + patch TXID / Reuse send_buf: copy + patch TXID
+                            send_buf.clear();
+                            if send_buf.capacity() < cached.len() {
+                                send_buf.reserve(cached.len() - send_buf.capacity());
+                            }
+                            send_buf.extend_from_slice(&cached);
+                            if send_buf.len() >= 2 {
+                                let id_bytes = tx_id.to_be_bytes();
+                                send_buf[0] = id_bytes[0];
+                                send_buf[1] = id_bytes[1];
+                            }
+                            let _ = socket.send_to(&send_buf, peer).await;
+                        }
+                    },
                     Ok(None) => {
                         // 需要异步处理（上游转发），spawn 处理 / Need async processing (upstream forwarding), spawn for handling
                         // packet_bytes 已经是 Bytes，无需再次 copy / packet_bytes is already Bytes, no need to copy again
