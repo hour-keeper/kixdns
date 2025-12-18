@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use arc_swap::ArcSwap;
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -53,10 +52,9 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("parse tcp bind addr")?;
 
-    let pipeline = Arc::new(ArcSwap::from_pointee(cfg));
-    let engine = Engine::new(pipeline.clone(), args.listener_label.clone());
+    let engine = Engine::new(cfg, args.listener_label.clone());
 
-    watcher::spawn(args.config.clone(), pipeline.clone());
+    watcher::spawn(args.config.clone(), engine.clone());
 
     // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
     let udp_workers = if args.udp_workers > 0 {

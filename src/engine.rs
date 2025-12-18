@@ -44,10 +44,14 @@ pub enum FastPathResponse {
     CacheHit { cached: Bytes, tx_id: u16 },
 }
 
+pub struct EngineInner {
+    pub pipeline: RuntimePipelineConfig,
+    pub compiled_pipelines: Vec<CompiledPipeline>,
+}
+
 #[derive(Clone)]
 pub struct Engine {
-    pipeline: Arc<ArcSwap<RuntimePipelineConfig>>,
-    compiled_pipelines: Arc<ArcSwap<Vec<CompiledPipeline>>>,
+    state: Arc<ArcSwap<EngineInner>>,
     cache: DnsCache,
     udp_client: Arc<UdpClient>,
     tcp_mux: Arc<TcpMultiplexer>,
@@ -68,7 +72,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(pipeline: Arc<ArcSwap<RuntimePipelineConfig>>, listener_label: String) -> Self {
+    pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> Self {
         // moka 缓存：最大 10000 条，默认 TTL 300 秒（会被实际 TTL 覆盖） / moka cache: max 10000 entries, default TTL 300 seconds (will be overridden by actual TTL)
         let cache = new_cache(10_000, 300);
         // Rule cache: 100k entries, 60s TTL / 规则缓存：10万条，60秒 TTL
@@ -78,12 +82,17 @@ impl Engine {
             .build();
 
         // UDP socket pool size from config / 从配置获取 UDP 套接字池大小
-        let udp_pool_size = pipeline.load().settings.udp_pool_size;
-        let tcp_pool_size = pipeline.load().settings.tcp_pool_size;
-        let compiled = compile_pipelines(&pipeline.load());
+        let udp_pool_size = cfg.settings.udp_pool_size;
+        let tcp_pool_size = cfg.settings.tcp_pool_size;
+        let compiled = compile_pipelines(&cfg);
+        
+        let state = Arc::new(ArcSwap::from_pointee(EngineInner {
+            pipeline: cfg,
+            compiled_pipelines: compiled,
+        }));
+
         Self {
-            pipeline,
-            compiled_pipelines: Arc::new(ArcSwap::from_pointee(compiled)),
+            state,
             cache,
             udp_client: Arc::new(UdpClient::new(udp_pool_size)),
             tcp_mux: Arc::new(TcpMultiplexer::new(tcp_pool_size)),
@@ -97,6 +106,17 @@ impl Engine {
             request_id_counter: Arc::new(AtomicU64::new(1)),
             inflight: Arc::new(DashMap::with_hasher(FxBuildHasher::default())),
         }
+    }
+
+    /// 重新加载配置并更新编译后的管线 / Reload configuration and update compiled pipelines
+    pub fn reload(&self, new_cfg: RuntimePipelineConfig) {
+        let compiled = compile_pipelines(&new_cfg);
+        self.state.store(Arc::new(EngineInner {
+            pipeline: new_cfg,
+            compiled_pipelines: compiled,
+        }));
+        // 清除规则缓存以确保新规则立即生效 / Clear rule cache to ensure new rules take effect immediately
+        self.rule_cache.invalidate_all();
     }
 
     #[inline]
@@ -155,10 +175,11 @@ impl Engine {
         let t_after_parse = t_start.elapsed();
         
         // 获取 pipeline ID / Get pipeline ID
-        let cfg = self.pipeline.load();
+        let state = self.state.load();
+        let cfg = &state.pipeline;
         let qclass = DNSClass::from(q.qclass);
         let (_pipeline_opt, pipeline_id) = select_pipeline(
-            &cfg,
+            cfg,
             q.qname,
             peer.ip(),
             qclass,
@@ -187,7 +208,7 @@ impl Engine {
         }
 
         // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
-        if let Some(compiled) = self.compiled_for(&pipeline_id) {
+        if let Some(compiled) = self.compiled_for(&state, &pipeline_id) {
             let qclass = DNSClass::from(q.qclass);
             if let Some(decision) = fast_static_match(
                 &compiled,
@@ -256,7 +277,8 @@ impl Engine {
         }
         self.metrics_inflight.fetch_add(1, Ordering::Relaxed);
         let _inflight_guard = InflightGuard(self.metrics_inflight.clone());
-        let cfg = self.pipeline.load();
+        let state = self.state.load();
+        let cfg = &state.pipeline;
         let min_ttl = cfg.min_ttl();
         let upstream_timeout = cfg.upstream_timeout();
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
@@ -282,7 +304,7 @@ impl Engine {
         let start = std::time::Instant::now();
 
         let (pipeline_opt, pipeline_id) = select_pipeline(
-            &cfg,
+            cfg,
             qname_ref,
             peer.ip(),
             qclass,
@@ -328,7 +350,7 @@ impl Engine {
         let mut reused_response: Option<ResponseContext> = None;
 
         let mut decision = match pipeline_opt {
-            Some(p) => self.apply_rules(&cfg, p, peer.ip(), &qname, qtype, qclass, edns_present, None),
+            Some(p) => self.apply_rules(&state, p, peer.ip(), &qname, qtype, qclass, edns_present, None),
             None => Decision::Forward {
                 upstream: cfg.settings.default_upstream.clone(),
                 response_matchers: Vec::new(),
@@ -386,7 +408,7 @@ impl Engine {
                         dedupe_registered = false;
                         skip_rules.clear();
                         decision = self.apply_rules(
-                            &cfg,
+                            &state,
                             p,
                             peer.ip(),
                             &qname,
@@ -719,7 +741,7 @@ impl Engine {
                                 let req = Message::from_bytes(packet).context("parse request")?;
                                 let resp_bytes = self
                                     .process_response_jump(
-                                        &cfg,
+                                        &state,
                                         pipeline,
                                         remaining_jumps,
                                         &req,
@@ -755,7 +777,7 @@ impl Engine {
                                         .find(|p| p.id == current_pipeline_id)
                                         .expect("pipeline missing while continuing");
                                     decision = self.apply_rules(
-                                        &cfg,
+                                        &state,
                                         pipeline,
                                         peer.ip(),
                                         &qname,
@@ -835,7 +857,7 @@ impl Engine {
                                         let req = Message::from_bytes(packet).context("parse request")?;
                                         let resp_bytes = self
                                             .process_response_jump(
-                                                &cfg,
+                                                &state,
                                                 pipeline,
                                                 remaining_jumps,
                                                 &req,
@@ -867,7 +889,7 @@ impl Engine {
                                             .find(|p| p.id == current_pipeline_id)
                                             .expect("pipeline missing while continuing");
                                         decision = self.apply_rules(
-                                            &cfg,
+                                            &state,
                                             pipeline,
                                             peer.ip(),
                                             &qname,
@@ -890,7 +912,7 @@ impl Engine {
     #[inline]
     fn apply_rules(
         &self,
-        cfg: &RuntimePipelineConfig,
+        state: &EngineInner,
         pipeline: &RuntimePipeline,
         client_ip: IpAddr,
         qname: &str,
@@ -912,10 +934,10 @@ impl Engine {
             }
         }
 
-        let upstream_default = cfg.settings.default_upstream.clone();
+        let upstream_default = state.pipeline.settings.default_upstream.clone();
 
         // 2. Candidate Selection (compiled index if available)
-        let mut candidate_indices = if let Some(compiled) = self.compiled_for(&pipeline.id) {
+        let mut candidate_indices = if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
             compiled.index.get_candidates(qname, qtype)
         } else {
             Vec::new()
@@ -944,7 +966,10 @@ impl Engine {
 
         // 3. Execute Rules
         'rules: for idx in candidate_indices {
-            let rule = &pipeline.rules[idx];
+            let rule = match pipeline.rules.get(idx) {
+                Some(r) => r,
+                None => continue, // Skip if index is out of bounds due to reload race / 如果由于重载竞争导致索引越界，则跳过
+            };
             if skip_rules.map_or(false, |set| set.contains(&rule.name)) {
                 continue;
             }
@@ -1382,7 +1407,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn process_response_jump(
         &self,
-        cfg: &RuntimePipelineConfig,
+        state: &EngineInner,
         mut pipeline_id: String,
         mut remaining_jumps: usize,
         req: &Message,
@@ -1395,6 +1420,7 @@ impl Engine {
         min_ttl: Duration,
         upstream_timeout: Duration,
     ) -> anyhow::Result<Bytes> {
+        let cfg = &state.pipeline;
         struct InflightCleanupGuard {
             inflight: Arc<DashMap<u64, Vec<oneshot::Sender<anyhow::Result<Bytes>>>, FxBuildHasher>>,
             hash: u64,
@@ -1432,7 +1458,7 @@ impl Engine {
                 return Ok(resp_bytes);
             }
 
-            let Some(pipeline) = cfg.pipelines.iter().find(|p| p.id == pipeline_id) else {
+            let Some(pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) else {
                 let resp_bytes = build_response(req, ResponseCode::ServFail, Vec::new())?;
                 for g in &mut cleanup_guards { g.defuse(); }
                 for h in &inflight_hashes { self.notify_inflight_waiters(*h, &resp_bytes).await; }
@@ -1442,7 +1468,7 @@ impl Engine {
             let dedupe_hash = Self::calculate_cache_hash_for_dedupe(&pipeline_id, qname, qtype);
             
             let mut decision = self.apply_rules(
-                cfg,
+                state,
                 pipeline,
                 peer.ip(),
                 qname,
@@ -1468,10 +1494,10 @@ impl Engine {
                     }
                     pipeline_id = pipeline;
                     local_jumps -= 1;
-                    if let Some(next_pipeline) = cfg.pipelines.iter().find(|p| p.id == pipeline_id) {
+                    if let Some(next_pipeline) = state.pipeline.pipelines.iter().find(|p| p.id == pipeline_id) {
                         skip_rules.clear();
                         decision = self.apply_rules(
-                            cfg,
+                            state,
                             next_pipeline,
                             peer.ip(),
                             qname,
@@ -1767,9 +1793,8 @@ fn select_pipeline<'a>(
 
 impl Engine {
     #[inline]
-    fn compiled_for(&self, pipeline_id: &str) -> Option<CompiledPipeline> {
-        let compiled = self.compiled_pipelines.load();
-        compiled
+    fn compiled_for(&self, state: &EngineInner, pipeline_id: &str) -> Option<CompiledPipeline> {
+        state.compiled_pipelines
             .iter()
             .find(|p| p.id.as_ref() == pipeline_id)
             .cloned()
