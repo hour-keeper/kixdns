@@ -62,7 +62,7 @@ pub struct Engine {
     listener_label: Arc<str>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
-    rule_cache: Cache<u64, RuleCacheEntry>,
+    rule_cache: Cache<u64, RuleCacheEntry, FxBuildHasher>,
     // Runtime metrics for diagnosing concurrency and upstream latency / 运行时指标，用于诊断并发和上游延迟
     pub metrics_inflight: Arc<AtomicUsize>,
     pub metrics_total_requests: Arc<AtomicU64>,
@@ -83,7 +83,7 @@ impl Engine {
         let rule_cache = Cache::builder()
             .max_capacity(100_000)
             .time_to_live(Duration::from_secs(60))
-            .build();
+            .build_with_hasher(FxBuildHasher::default());
 
         // UDP socket pool size from config / 从配置获取 UDP 套接字池大小
         let udp_pool_size = cfg.settings.udp_pool_size;
@@ -492,50 +492,10 @@ impl Engine {
                 allow_reuse,
             } => {
                 let mut cleanup_guard = None;
-                let resp = if allow_reuse {
-                    if let Some(ctx) = reused_response.take() {
-                        Ok(ctx.raw)
-                    } else {
-                        if !dedupe_registered {
-                            use dashmap::mapref::entry::Entry;
-                            let rx = match self.inflight.entry(dedupe_hash) {
-                                Entry::Occupied(mut entry) => {
-                                    let (tx, rx) = oneshot::channel();
-                                    entry.get_mut().push(tx);
-                                    Some(rx)
-                                }
-                                Entry::Vacant(entry) => {
-                                    entry.insert(Vec::new());
-                                    dedupe_registered = true;
-                                    cleanup_guard = Some(InflightCleanupGuard::new(self.inflight.clone(), dedupe_hash));
-                                    None
-                                }
-                            };
-
-                            if let Some(rx) = rx {
-                                match rx.await {
-                                    Ok(Ok(bytes)) => {
-                                        let mut resp_vec = bytes.to_vec();
-                                        if resp_vec.len() >= 2 {
-                                            let id_bytes = tx_id.to_be_bytes();
-                                            resp_vec[0] = id_bytes[0];
-                                            resp_vec[1] = id_bytes[1];
-                                        }
-                                        return Ok(Bytes::from(resp_vec));
-                                    }
-                                    Ok(Err(e)) => return Err(e),
-                                    Err(_) => {
-                                        // sender dropped, fallthrough to attempt upstream
-                                    }
-                                }
-                            }
-                        }
-                        self.forward_upstream(packet, &upstream, upstream_timeout, transport).await
-                    }
+                let resp = if allow_reuse && reused_response.is_some() {
+                    Ok(reused_response.take().unwrap().raw)
                 } else {
-                    // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
-                    // and force a new request.
-                    
+                    // In-flight merging logic / 合并进行中的重复请求逻辑
                     if !dedupe_registered {
                         use dashmap::mapref::entry::Entry;
                         let rx = match self.inflight.entry(dedupe_hash) {
