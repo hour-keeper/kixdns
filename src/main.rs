@@ -21,6 +21,44 @@ use crate::config::load_config;
 use crate::engine::{Engine, FastPathResponse};
 use crate::matcher::RuntimePipelineConfig;
 
+/// Result type for batch UDP receive operations
+enum RecvResult {
+    Packet(bytes::Bytes, std::net::SocketAddr),
+    NoData,
+    Error,
+}
+
+/// Set transaction ID in the first two bytes of a DNS packet
+///
+/// This function modifies the DNS message header by replacing the transaction ID
+/// (the first two bytes) with the provided `tx_id` value in big-endian format.
+///
+/// # Parameters
+/// * `packet` - A mutable slice representing the DNS packet. Must be at least 2 bytes.
+/// * `tx_id` - The new transaction ID to set in the packet header.
+///
+/// # Behavior
+/// If the packet is smaller than 2 bytes, the function does nothing silently.
+/// This is safe because DNS packets must be at least 12 bytes to be valid.
+#[inline]
+fn set_transaction_id(packet: &mut [u8], tx_id: u16) {
+    if packet.len() >= 2 {
+        packet[..2].copy_from_slice(&tx_id.to_be_bytes());
+    }
+}
+
+/// Spawn an async task to send data to peer when socket buffer is full
+///
+/// This is used as a fallback when `try_send_to` returns WouldBlock to ensure
+/// responses are not silently dropped under backpressure.
+fn spawn_async_send(socket: Arc<UdpSocket>, data: bytes::Bytes, peer: SocketAddr) {
+    tokio::spawn(async move {
+        if let Err(e) = socket.send_to(&data, peer).await {
+            tracing::warn!("async send fallback failed to {}: {}", peer, e);
+        }
+    });
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "KixDNS async DNS with hot-reload pipelines", long_about = None)]
 struct Args {
@@ -203,7 +241,7 @@ async fn run_udp_worker(
         const MAX_BATCH: usize = 32;
 
         while batch_count < MAX_BATCH {
-            let mut packet_opt = RECV_BUF.with(|rb| {
+            let recv_result = RECV_BUF.with(|rb| {
                 let mut buf = rb.borrow_mut();
                 let current_len = buf.len();
                 if buf.capacity() < 4096 {
@@ -213,21 +251,21 @@ async fn run_udp_worker(
                 match socket.try_recv_buf_from(&mut *buf) {
                     Ok((_len, peer)) => {
                         let packet = buf.split().freeze();
-                        Some((packet, peer))
+                        RecvResult::Packet(packet, peer)
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => RecvResult::NoData,
                     Err(_e) => {
                         // 严重错误则退出 / Exit on severe error
-                        Some((bytes::Bytes::new(), "0.0.0.0:0".parse().unwrap())) // Dummy to trigger error handling
+                        RecvResult::Error
                     }
                 }
             });
 
-            if let Some((packet_bytes, peer)) = packet_opt.take() {
-                if packet_bytes.is_empty() && peer.port() == 0 {
-                    // 模拟错误处理 / Simulated error handling
-                    break;
-                }
+            let (packet_bytes, peer) = match recv_result {
+                RecvResult::Packet(packet, peer) => (packet, peer),
+                RecvResult::NoData => break,
+                RecvResult::Error => break,
+            };
                 
                 batch_count += 1;
 
@@ -235,10 +273,16 @@ async fn run_udp_worker(
                 match engine.handle_packet_fast(&packet_bytes, peer) {
                     Ok(Some(resp)) => match resp {
                         FastPathResponse::Direct(bytes) => {
-                            let _ = socket.try_send_to(&bytes, peer);
+                            match socket.try_send_to(&bytes, peer) {
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // Fallback to async send on backpressure
+                                    spawn_async_send(Arc::clone(&socket), bytes, peer);
+                                }
+                                _ => {}
+                            }
                         }
                         FastPathResponse::CacheHit { cached, tx_id } => {
-                            SEND_BUF.with(|sb| {
+                            let send_result = SEND_BUF.with(|sb| {
                                 let mut send_buf = sb.borrow_mut();
                                 send_buf.clear();
                                 let cap = send_buf.capacity();
@@ -246,13 +290,19 @@ async fn run_udp_worker(
                                     send_buf.reserve(cached.len() - cap);
                                 }
                                 send_buf.extend_from_slice(&cached);
-                                if send_buf.len() >= 2 {
-                                    let id_bytes = tx_id.to_be_bytes();
-                                    send_buf[0] = id_bytes[0];
-                                    send_buf[1] = id_bytes[1];
-                                }
-                                let _ = socket.try_send_to(&send_buf, peer);
+                                set_transaction_id(&mut send_buf, tx_id);
+                                socket.try_send_to(&send_buf, peer)
                             });
+                            
+                            if let Err(ref e) = send_result {
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    // Fallback to async send on backpressure
+                                    let mut response = bytes::BytesMut::with_capacity(cached.len());
+                                    response.extend_from_slice(&cached);
+                                    set_transaction_id(&mut response, tx_id);
+                                    spawn_async_send(Arc::clone(&socket), response.freeze(), peer);
+                                }
+                            }
                         }
                     },
                     Ok(None) => {
@@ -266,10 +316,6 @@ async fn run_udp_worker(
                     }
                     Err(_) => {}
                 }
-            } else {
-                // 没有更多数据，跳出批量循环 / No more data, break batch loop
-                break;
-            }
         }
     }
 }

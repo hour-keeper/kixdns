@@ -236,20 +236,8 @@ pub fn build_static_response_fast(
     let mut pos = 12;
     let packet_len = packet.len();
     
-    // Skip Name
-    loop {
-        if pos >= packet_len { return None; }
-        let len = packet[pos];
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        if (len & 0xC0) == 0xC0 {
-            pos += 2;
-            break;
-        }
-        pos += 1 + (len as usize);
-    }
+    // Skip Name using the validated skip_name function
+    pos = skip_name(packet, pos)?;
     
     if pos + 4 > packet_len { return None; }
     pos += 4; // Type + Class
