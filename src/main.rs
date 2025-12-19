@@ -214,7 +214,7 @@ async fn run_udp_worker(
                 request_count += 1;
                 if request_count >= 100 {
                     request_count = 0;
-                    engine.adjust_flow_control().await;
+                    engine.adjust_flow_control();  // Now synchronous with atomic CAS
                 }
                 
                 // 快速路径：尝试同步处理（缓存命中等场景） / Fast path: try synchronous handling (cache hit scenarios, etc.)

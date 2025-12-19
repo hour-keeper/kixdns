@@ -20,7 +20,7 @@ pub struct PipelineConfig {
     pub pipelines: Vec<Pipeline>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GlobalSettings {
     /// 最小TTL秒数，缺省0。 / Minimum TTL in seconds, defaults to 0
     #[serde(default = "default_min_ttl")]
@@ -61,6 +61,26 @@ pub struct GlobalSettings {
     /// 流控调整间隔（秒）。 / Flow control adjustment interval (seconds)
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
+}
+
+impl Default for GlobalSettings {
+    fn default() -> Self {
+        Self {
+            min_ttl: default_min_ttl(),
+            bind_udp: default_bind_udp(),
+            bind_tcp: default_bind_tcp(),
+            default_upstream: default_upstream(),
+            upstream_timeout_ms: default_upstream_timeout_ms(),
+            response_jump_limit: default_response_jump_limit(),
+            udp_pool_size: default_udp_pool_size(),
+            tcp_pool_size: default_tcp_pool_size(),
+            flow_control_initial_permits: default_flow_control_initial_permits(),
+            flow_control_min_permits: default_flow_control_min_permits(),
+            flow_control_max_permits: default_flow_control_max_permits(),
+            flow_control_latency_threshold_ms: default_flow_control_latency_threshold_ms(),
+            flow_control_adjustment_interval_secs: default_flow_control_adjustment_interval_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
