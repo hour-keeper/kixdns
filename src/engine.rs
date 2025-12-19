@@ -1187,7 +1187,7 @@ impl Engine {
             tracing::debug!(upstream=%upstream, upstream_ns = dur.as_nanos() as u64, "upstream call latency");
         } else if let Err(e) = &res {
             let dur = start.elapsed();
-            tracing::warn!(upstream=%upstream, error=%e, elapsed_ns = dur.as_nanos() as u64, "upstream call failed");
+            tracing::info!(upstream=%upstream, error=%e, elapsed_ns = dur.as_nanos() as u64, "upstream call failed");
         }
         res
     }

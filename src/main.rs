@@ -130,13 +130,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing(debug: bool) {
-    // 为压测降低日志开销：默认禁用 JSON，非 debug 仅 warn / Reduce logging overhead for benchmarking: disable JSON by default, warn-only in non-debug mode
+    // 默认关闭所有日志输出以最大化性能，除非显式指定
+    // Disable all logging by default for maximum performance unless explicitly enabled
     let fmt_layer = fmt::layer()
         .with_target(false)
         .with_ansi(false)
         .with_level(debug);
 
-    let level = if debug { "debug" } else { "warn" };
+    let level = if debug { "debug" } else { "off" };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     tracing_subscriber::registry()
         .with(filter)
