@@ -192,8 +192,10 @@ impl Drop for PermitGuard {
 
 impl Engine {
     pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> Self {
-        // moka 缓存：最大 10000 条，默认 TTL 300 秒（会被实际 TTL 覆盖） / moka cache: max 10000 entries, default TTL 300 seconds (will be overridden by actual TTL)
-        let cache = new_cache(10_000, 300);
+        // moka 缓存：容量由配置控制（默认 10000 条），默认 TTL 300 秒（会被实际 TTL 覆盖）
+        // moka cache capacity is configurable via settings.cache_capacity (default 10000)
+        let cache_capacity = cfg.settings.cache_capacity;
+        let cache = new_cache(cache_capacity, 300);
         // Rule cache: 10k entries, 60s TTL / 规则缓存：1万条，60秒 TTL
         let rule_cache = Cache::builder()
             .max_capacity(10_000)
