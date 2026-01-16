@@ -91,6 +91,11 @@
                                     <input type="number" class="form-control" v-model.number="config.settings.cache_capacity" placeholder="10000">
                                     <div class="form-text small">moka 缓存最大条目数 (默认 10000)</div>
                                 </div>
+                                <div class="col-md-3">
+                                    <label class="form-label">DashMap Shards</label>
+                                    <input type="number" class="form-control" v-model.number="config.settings.dashmap_shards" placeholder="0=自动">
+                                    <div class="form-text small">0=自动 (默认)，更多 shards=更少锁竞争但更多内存</div>
+                                </div>
                         </div>
 
                         <hr>
@@ -430,7 +435,8 @@
                         flow_control_max_permits: 800,
                         flow_control_latency_threshold_ms: 100,
                         flow_control_adjustment_interval_secs: 5,
-                        cache_capacity: 10000
+                        cache_capacity: 10000,
+                        dashmap_shards: 0
                     },
                     pipeline_select: [],
                     pipelines: []

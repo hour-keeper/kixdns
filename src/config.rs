@@ -34,6 +34,9 @@ pub struct GlobalSettings {
     /// Moka 缓存最大条目数（默认 10000） / Moka cache max entries (default 10000)
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
+    /// DashMap shard 数量（0=自动，默认 0）。更多 shards=更少锁竞争但更多内存开销 / DashMap shard count (0=auto, default 0). More shards=less lock contention but more memory overhead
+    #[serde(default = "default_dashmap_shards")]
+    pub dashmap_shards: usize,
     /// 默认上游DNS。 / Default upstream DNS
     #[serde(default = "default_upstream")]
     pub default_upstream: String,
@@ -83,6 +86,7 @@ impl Default for GlobalSettings {
             flow_control_latency_threshold_ms: default_flow_control_latency_threshold_ms(),
             flow_control_adjustment_interval_secs: default_flow_control_adjustment_interval_secs(),
             cache_capacity: default_cache_capacity(),
+            dashmap_shards: default_dashmap_shards(),
         }
     }
 
@@ -90,6 +94,10 @@ impl Default for GlobalSettings {
 
 fn default_cache_capacity() -> u64 {
     10_000
+}
+
+fn default_dashmap_shards() -> usize {
+    0 // 0 means use DashMap default (num_cpus * 4)
 }
 
 #[derive(Debug, Clone, Deserialize)]

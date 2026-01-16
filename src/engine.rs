@@ -210,6 +210,7 @@ impl Engine {
         let flow_control_max_permits = cfg.settings.flow_control_max_permits;
         let flow_control_latency_threshold_ms = cfg.settings.flow_control_latency_threshold_ms;
         let flow_control_adjustment_interval_secs = cfg.settings.flow_control_adjustment_interval_secs;
+        let dashmap_shards = cfg.settings.dashmap_shards;
         
         let compiled = compile_pipelines(&cfg);
         
@@ -241,13 +242,21 @@ impl Engine {
             metrics_upstream_calls: Arc::new(AtomicU64::new(0)),
             metrics_last_upstream_latency_ns: Arc::new(AtomicU64::new(0)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
-            // Use default shard count (DashMap default) to reduce fixed memory overhead,
-            // but still set a modest initial capacity to avoid tiny re-allocs.
-            // This keeps memory low while retaining reasonable throughput for typical loads.
-            inflight: Arc::new(DashMap::with_capacity_and_hasher(
-                128,
-                FxBuildHasher::default(),
-            )),
+            // DashMap configuration: shard count and initial capacity
+            // If dashmap_shards is 0, use DashMap default (num_cpus * 4)
+            // More shards = less lock contention but more memory overhead
+            inflight: if dashmap_shards == 0 {
+                Arc::new(DashMap::with_capacity_and_hasher(
+                    128,
+                    FxBuildHasher::default(),
+                ))
+            } else {
+                Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
+                    128,
+                    FxBuildHasher::default(),
+                    dashmap_shards,
+                ))
+            },
             permit_manager,
             flow_control_state,
         }
@@ -267,25 +276,34 @@ impl Engine {
     /// 动态调整 flow control permits 基于系统负载和延迟 / Adaptively adjust flow control permits based on system load and latency
     pub fn adjust_flow_control(&self) {
         let state = &self.flow_control_state;
-        
+
         // Get current time in milliseconds
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        
-        let last_ms = state.last_adjustment_ms.load(Ordering::Relaxed);
-        
-        // 检查调整间隔是否已过期 / Check if adjustment interval has passed
-        if now_ms.saturating_sub(last_ms) < state.adjustment_interval_ms {
-            return;
-        }
-        
-        // Try to CAS the timestamp - only one thread will succeed
-        if state.last_adjustment_ms.compare_exchange(
-            last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
-        ).is_err() {
-            return;  // Another thread already updated
+
+        // Use compare_exchange_weak in a loop for better concurrency
+        // This follows Rust's best practice for lock-free synchronization
+        let mut last_ms = state.last_adjustment_ms.load(Ordering::Acquire);
+        loop {
+            // Check if adjustment interval has passed
+            if now_ms.saturating_sub(last_ms) < state.adjustment_interval_ms {
+                return;
+            }
+
+            // Try to update timestamp - only one thread will succeed
+            // Using weak variant is acceptable in a loop as it can spuriously fail
+            match state.last_adjustment_ms.compare_exchange_weak(
+                last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
+            ) {
+                Ok(_) => break,  // Successfully acquired adjustment right
+                Err(current) => {
+                    // Another thread updated timestamp, reload and recheck
+                    last_ms = current;
+                    continue;
+                }
+            }
         }
 
         let inflight = self.permit_manager.inflight();
@@ -294,9 +312,9 @@ impl Engine {
 
         // 决策逻辑：如果延迟高或进行中请求多，减少 permits
         // Decision logic: reduce permits if latency is high or inflight requests are many
-        let should_reduce = latest_latency > state.critical_latency_threshold_ns 
+        let should_reduce = latest_latency > state.critical_latency_threshold_ns
             || inflight > current_permits * 2 / 3;
-        
+
         let should_increase = latest_latency < state.critical_latency_threshold_ns / 2
             && inflight < current_permits / 3;
 
@@ -2009,7 +2027,9 @@ impl UdpClient {
                 let socket_clone = socket.clone();
                 let inflight_clone = inflight.clone();
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
+                    // Use BytesMut for efficient buffer management and zero-copy ID rewrite
+                    let mut buf = BytesMut::with_capacity(4096);
+                    buf.resize(4096, 0);
                     loop {
                         match socket_clone.recv_from(&mut buf).await {
                             Ok((len, src)) => {
@@ -2017,11 +2037,14 @@ impl UdpClient {
                                     let id = u16::from_be_bytes([buf[0], buf[1]]);
                                     if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
                                         if src == expected_addr {
-                                            // Restore original ID - modify in place then copy
+                                            // Zero-copy: modify in place and freeze
                                             let orig_bytes = original_id.to_be_bytes();
                                             buf[0] = orig_bytes[0];
                                             buf[1] = orig_bytes[1];
-                                            let _ = tx.send(Ok(Bytes::copy_from_slice(&buf[..len])));
+                                            let response = buf.split_to(len).freeze();
+                                            let _ = tx.send(Ok(response));
+                                            // Reset buffer for next iteration
+                                            buf.resize(4096, 0);
                                         }
                                     }
                                 }
@@ -2233,11 +2256,11 @@ impl TcpMuxClient {
                     break;
                 }
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
-                
+
                 // Resize buffer if needed, reusing allocation
-                reusable_buf.clear();
+                // resize() handles both truncation and extension, no need for clear()
                 reusable_buf.resize(resp_len, 0);
-                
+
                 if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
                     debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
                     Self::fail_all_async(&pending, anyhow::anyhow!("tcp read body failed"), &conn)
