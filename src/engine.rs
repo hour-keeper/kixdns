@@ -282,19 +282,28 @@ impl Engine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        
-        let last_ms = state.last_adjustment_ms.load(Ordering::Relaxed);
-        
-        // 检查调整间隔是否已过期 / Check if adjustment interval has passed
-        if now_ms.saturating_sub(last_ms) < state.adjustment_interval_ms {
-            return;
-        }
-        
-        // Try to CAS the timestamp - only one thread will succeed
-        if state.last_adjustment_ms.compare_exchange(
-            last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
-        ).is_err() {
-            return;  // Another thread already updated
+
+        // Use compare_exchange_weak in a loop for better concurrency
+        // This follows Rust's best practice for lock-free synchronization
+        let mut last_ms = state.last_adjustment_ms.load(Ordering::Acquire);
+        loop {
+            // Check if adjustment interval has passed
+            if now_ms.saturating_sub(last_ms) < state.adjustment_interval_ms {
+                return;
+            }
+
+            // Try to update timestamp - only one thread will succeed
+            // Using weak variant is acceptable in a loop as it can spuriously fail
+            match state.last_adjustment_ms.compare_exchange_weak(
+                last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed
+            ) {
+                Ok(_) => break,  // Successfully acquired adjustment right
+                Err(current) => {
+                    // Another thread updated timestamp, reload and recheck
+                    last_ms = current;
+                    continue;
+                }
+            }
         }
 
         let inflight = self.permit_manager.inflight();
@@ -303,9 +312,9 @@ impl Engine {
 
         // 决策逻辑：如果延迟高或进行中请求多，减少 permits
         // Decision logic: reduce permits if latency is high or inflight requests are many
-        let should_reduce = latest_latency > state.critical_latency_threshold_ns 
+        let should_reduce = latest_latency > state.critical_latency_threshold_ns
             || inflight > current_permits * 2 / 3;
-        
+
         let should_increase = latest_latency < state.critical_latency_threshold_ns / 2
             && inflight < current_permits / 3;
 
@@ -2247,11 +2256,11 @@ impl TcpMuxClient {
                     break;
                 }
                 let resp_len = u16::from_be_bytes(len_buf) as usize;
-                
+
                 // Resize buffer if needed, reusing allocation
-                reusable_buf.clear();
+                // resize() handles both truncation and extension, no need for clear()
                 reusable_buf.resize(resp_len, 0);
-                
+
                 if let Err(err) = reader.read_exact(&mut reusable_buf[..resp_len]).await {
                     debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
                     Self::fail_all_async(&pending, anyhow::anyhow!("tcp read body failed"), &conn)
