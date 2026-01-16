@@ -121,6 +121,17 @@ pub struct RuntimeResponseMatcherWithOp {
 
 impl RuntimePipelineConfig {
     pub fn from_config(cfg: PipelineConfig) -> anyhow::Result<Self> {
+        // Validate cache_capacity configuration
+        if cfg.settings.cache_capacity == 0 {
+            anyhow::bail!("cache_capacity must be greater than 0");
+        }
+        if cfg.settings.cache_capacity > 1_000_000 {
+            tracing::warn!(
+                cache_capacity = cfg.settings.cache_capacity,
+                "cache_capacity is very large, may cause high memory usage"
+            );
+        }
+
         let mut pipelines = Vec::new();
         for p in cfg.pipelines {
             let mut rules = Vec::new();

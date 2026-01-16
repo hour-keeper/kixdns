@@ -210,6 +210,7 @@ impl Engine {
         let flow_control_max_permits = cfg.settings.flow_control_max_permits;
         let flow_control_latency_threshold_ms = cfg.settings.flow_control_latency_threshold_ms;
         let flow_control_adjustment_interval_secs = cfg.settings.flow_control_adjustment_interval_secs;
+        let dashmap_shards = cfg.settings.dashmap_shards;
         
         let compiled = compile_pipelines(&cfg);
         
@@ -241,13 +242,21 @@ impl Engine {
             metrics_upstream_calls: Arc::new(AtomicU64::new(0)),
             metrics_last_upstream_latency_ns: Arc::new(AtomicU64::new(0)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
-            // Use default shard count (DashMap default) to reduce fixed memory overhead,
-            // but still set a modest initial capacity to avoid tiny re-allocs.
-            // This keeps memory low while retaining reasonable throughput for typical loads.
-            inflight: Arc::new(DashMap::with_capacity_and_hasher(
-                128,
-                FxBuildHasher::default(),
-            )),
+            // DashMap configuration: shard count and initial capacity
+            // If dashmap_shards is 0, use DashMap default (num_cpus * 4)
+            // More shards = less lock contention but more memory overhead
+            inflight: if dashmap_shards == 0 {
+                Arc::new(DashMap::with_capacity_and_hasher(
+                    128,
+                    FxBuildHasher::default(),
+                ))
+            } else {
+                Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
+                    128,
+                    FxBuildHasher::default(),
+                    dashmap_shards,
+                ))
+            },
             permit_manager,
             flow_control_state,
         }
@@ -2009,7 +2018,9 @@ impl UdpClient {
                 let socket_clone = socket.clone();
                 let inflight_clone = inflight.clone();
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
+                    // Use BytesMut for efficient buffer management and zero-copy ID rewrite
+                    let mut buf = BytesMut::with_capacity(4096);
+                    buf.resize(4096, 0);
                     loop {
                         match socket_clone.recv_from(&mut buf).await {
                             Ok((len, src)) => {
@@ -2017,11 +2028,14 @@ impl UdpClient {
                                     let id = u16::from_be_bytes([buf[0], buf[1]]);
                                     if let Some((_, (original_id, expected_addr, tx))) = inflight_clone.remove(&id) {
                                         if src == expected_addr {
-                                            // Restore original ID - modify in place then copy
+                                            // Zero-copy: modify in place and freeze
                                             let orig_bytes = original_id.to_be_bytes();
                                             buf[0] = orig_bytes[0];
                                             buf[1] = orig_bytes[1];
-                                            let _ = tx.send(Ok(Bytes::copy_from_slice(&buf[..len])));
+                                            let response = buf.split_to(len).freeze();
+                                            let _ = tx.send(Ok(response));
+                                            // Reset buffer for next iteration
+                                            buf.resize(4096, 0);
                                         }
                                     }
                                 }
