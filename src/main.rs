@@ -303,8 +303,10 @@ async fn handle_tcp_conn(
 ) -> anyhow::Result<()> {
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
-    // Reuse buffer across requests on the same connection
-    let mut buf = Vec::with_capacity(512);
+
+    // Reusable buffer to avoid per-frame heap allocation / 可复用缓冲区，避免每帧堆分配
+    // 使用 BytesMut 以支持零拷贝操作 / Use BytesMut for zero-copy operations
+    let mut buf = bytes::BytesMut::with_capacity(MAX_TCP_FRAME);
 
     loop {
         if let Err(err) = stream.read_exact(&mut len_buf).await {
@@ -318,7 +320,8 @@ async fn handle_tcp_conn(
             return Ok(());
         }
 
-        // Resize buffer only if needed, reuse capacity
+        // Reuse buffer: resize to exact frame length / 复用缓冲区：调整到精确帧长度
+        // resize() is safe and efficient - it only initializes new bytes if growing
         buf.clear();
         buf.resize(frame_len, 0);
         if stream.read_exact(&mut buf).await.is_err() {

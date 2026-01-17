@@ -1,9 +1,7 @@
 /target/
 Cargo.lock
 .claude/
-
+claude.md
 # Audit and report documents
-audit_report*.md
-compliance_report.md
-review_report.md
+*_report*.md
 diff_review.txt
